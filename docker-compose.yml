@@ -1,0 +1,132 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: satsa_db
+      POSTGRES_USER: satsa_user
+      POSTGRES_PASSWORD: satsa_password
+    volumes:
+      - sat_sa_postgres_2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U satsa_user -d satsa_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - sat-sa-net-2
+
+  backend:
+    image: sat-sa-backend-2:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://satsa_user:satsa_password@db:5432/satsa_db
+      # Local LLM (opt-in). When the ai profile is active these point the
+      # backend at the compose Ollama service; the OLLAMA_ENABLED switch is
+      # what actually turns the endpoints on, so plain `docker compose up`
+      # behaves exactly as before.
+      OLLAMA_ENABLED: "${OLLAMA_ENABLED:-false}"
+      # Inside a container 127.0.0.1 can never reach a host-side Ollama, so
+      # the container-network hostname is the right default; override in .env
+      # only if you run Ollama elsewhere.
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://ollama:11434}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2:3b}"
+      # CPU-only inference can spend minutes pre-filling a long prompt before
+      # the first token; the generation budget must exceed that, the connect
+      # clock should stay short so a dead runtime fails fast.
+      OLLAMA_CONNECT_TIMEOUT: "${OLLAMA_CONNECT_TIMEOUT:-10}"
+      OLLAMA_GENERATION_TIMEOUT: "${OLLAMA_GENERATION_TIMEOUT:-300}"
+      # The Vercel-hosted dashboard calls this backend directly (CORS).
+      # Exact origins go in ALLOWED_ORIGINS; the suffix rule covers every
+      # *.vercel.app deployment/preview of this project.
+      ALLOWED_ORIGIN_SUFFIXES: "${ALLOWED_ORIGIN_SUFFIXES:-.vercel.app}"
+      # Browsers treat 127.0.0.1 and localhost as distinct origins. Without
+      # both loopback spellings here, a dashboard opened at http://127.0.0.1:3001
+      # fails every direct-to-backend preflight with 400 "Disallowed CORS
+      # origin". Same-origin traffic through the nginx proxy is unaffected.
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001}"
+      # Keep the model warm and inference tuned (see .env.example).
+      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-30m}"
+      OLLAMA_NUM_CTX: "${OLLAMA_NUM_CTX:-2048}"
+      OLLAMA_NUM_THREADS: "${OLLAMA_NUM_THREADS:-0}"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "8001:8000"
+    networks:
+      - sat-sa-net-2
+
+  frontend:
+    image: sat-sa-frontend-2:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3001:80"
+    networks:
+      - sat-sa-net-2
+
+  # ------------------------------------------------------------ local AI ----
+  # `docker compose --profile ai up` additionally starts a local Ollama
+  # runtime and pre-pulls the default model once. Nothing here is started by
+  # a plain `docker compose up`, and the frontend/backend behave identically
+  # either way.
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    profiles: ["ai"]
+    volumes:
+      - sat_sa_ollama_2:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - sat-sa-net-2
+
+  ollama-init:
+    image: ollama/ollama:latest
+    profiles: ["ai"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    # Must join the same network as the ollama service — without this the
+    # init container lands on the project default network and cannot resolve
+    # the "ollama" hostname (DNS lookup fails, pull never happens).
+    networks:
+      - sat-sa-net-2
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      MODEL_TO_PULL: "${OLLAMA_MODEL:-llama3.2:3b}"
+    entrypoint: ["/bin/sh", "-c"]
+    # Idempotent: pulls the default model only if it is not already present.
+    # ($$ escapes the dollar so the shell inside the container expands it.)
+    command:
+      - |
+        ollama list | grep -q "$$MODEL_TO_PULL" || ollama pull "$$MODEL_TO_PULL"
+
+volumes:
+  sat_sa_postgres_2:
+  sat_sa_ollama_2:
+
+networks:
+  sat-sa-net-2:
+    driver: bridge
+
